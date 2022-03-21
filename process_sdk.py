@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 from zipfile import ZipFile
 import tempfile
+import shlex
 
 import requests
 from alive_progress import alive_bar
@@ -55,7 +56,7 @@ def prepare_ida(sdkver):
     
     if not IDA_PATH.exists():
         logging.info('Preparing IDA Tools...')
-        downfile('https://onepoint.misty.workers.dev/gd-pub-temp/ida-leak/IDA-7.7.220118-fullpatch.zip', 'ida77.zip')   
+        downfile('https://onepoint.misty.workers.dev/gd-pub-temp/ida-leak-wine/IDA-7.7.220118-fullpatch-wine.zip', 'ida77.zip')   
         IDA_PATH.mkdir()
         shutil.unpack_archive(d / 'ida77.zip', IDA_PATH)
         
@@ -75,35 +76,40 @@ def prepare_ida(sdkver):
 def get_til_prefix(platform, version):
     return 'ida%s%s' % (platform, version)
 
+def call_process(*args, **kwargs):
+    logging.info("Running: \n    [%s]" % 
+        shlex.join(list(map(str, args[0])))
+    )
+    return subprocess.call(*args, **kwargs)
+
 def do_idaclang_build(platform, version):
     build_dir = ROOT_DIR / 'sdkhdr_build' / f'idasdk_{platform}'
     ida_path = Path(os.path.relpath(IDA_PATH, build_dir))
     sdk_path = Path(os.path.relpath(SDK_PATH, build_dir))
     out_dir = Path(os.path.relpath(OUT_DIR, build_dir))
+    toLinuxPath = lambda x: str(x).replace('\\', '/')
     command = [
         'make',
         '-f', '%s' % (f'idasdk_{platform}.mak'),
         'TIL_NAME=%s' % get_til_prefix(platform, version), 
         'IDASDK_DESC=%s' % (f"IDA{version} {platform}"), 
-        'IDASDK=%s' % SDK_PATH,
-        'IDACLANG=%s' % (IDA_PATH / 'idaclang.exe'),
-        'TILIB64=%s' % (IDA_PATH / 'tilib64.exe'),
-        'TIL_OUT_DIR=%s' % (out_dir)
+        'IDASDK=%s' % toLinuxPath(sdk_path),
+        'IDACLANG=%s' % toLinuxPath(ida_path / 'idaclang.exe'),
+        'TILIB64=%s' % toLinuxPath(ida_path / 'tilib64.exe'),
+        'TIL_OUT_DIR=%s' % toLinuxPath(out_dir)
         ]
-    import shlex
     
-    logging.info('Running: \n%s', shlex.join(command))
-    subprocess.call(command, cwd=build_dir)
+    call_process(command, cwd=build_dir)
 
 def do_idatil_extract(libtype, platform, version):
     build_dir = ROOT_DIR / 'sdklib_build'
     libpath = SDK_PATH / 'lib' / libtype
     objs = libpath / 'objs'
     objs.mkdir(exist_ok=True)
-    subprocess.call(['7z', 'e', '-aoa', libpath / 'pro.lib'], cwd=objs)
-    subprocess.call(['7z', 'e', '-aoa', libpath / 'network.lib'], cwd=objs)
-    subprocess.call(['7z', 'e', '-aoa', libpath / 'compress.lib'], cwd=objs)
-    subprocess.call(['7z', 'e', '-aoa', libpath / 'unicode.lib'], cwd=objs)
+    call_process(['7z', 'e', '-aoa', libpath / 'pro.lib'], cwd=objs)
+    call_process(['7z', 'e', '-aoa', libpath / 'network.lib'], cwd=objs)
+    call_process(['7z', 'e', '-aoa', libpath / 'compress.lib'], cwd=objs)
+    call_process(['7z', 'e', '-aoa', libpath / 'unicode.lib'], cwd=objs)
     with tempfile.TemporaryDirectory() as tmpdir:
         idaenv = dict(os.environ)
         idaenv['TVHEADLESS'] = "1"
@@ -121,33 +127,36 @@ def do_idatil_extract(libtype, platform, version):
             outputtil = c.with_suffix('.til')
             if outputtil.exists():
                 continue
-            subprocess.call([IDA_PATH / 'idat64.exe', '-c', '-A', '-S%s %s' % (build_dir / 'export_til.py', outputtil), c], env=idaenv, cwd=objs)
+            call_process([IDA_PATH / 'idat64.exe', '-c', '-A', '-S%s %s' % (build_dir / 'export_til.py', outputtil), c], env=idaenv, cwd=objs)
             readlog()
     
         for c in objs.glob('*.til'):
             logging.info("disabling ordinal types for %s", c.name)
-            subprocess.call([IDA_PATH / 'tilib64.exe', '-#-', c], cwd=objs)
+            call_process([IDA_PATH / 'tilib64.exe', '-#-', c], cwd=objs)
         
         tilname = f'{get_til_prefix(platform, version)}_libtypes'
         outputtil = OUT_DIR / (tilname + '.til')
-        subprocess.call([IDA_PATH / 'idat64.exe', '-c', '-A', '-S"%s" "%s" "%s" "%s" "%s"' % 
+        call_process([IDA_PATH / 'idat64.exe', '-c', '-A', '-S"%s" "%s" "%s" "%s" "%s"' % 
             (build_dir / 'merge_til.py', outputtil, tilname, f"SDK static lib types for IDA{version} {platform}", objs), 
             '-t'], env=idaenv, cwd=objs)
         readlog()
 
-        subprocess.call([IDA_PATH / 'tilib64.exe', '-#-', outputtil], cwd=objs)
+        call_process([IDA_PATH / 'tilib64.exe', '-#-', outputtil], cwd=objs)
 
 def do_export_til_headers():
     for c in OUT_DIR.glob('*.til'):
         h = c.with_suffix('.h')
-        with open(h, 'wb') as f:
-            subprocess.run([IDA_PATH / 'tilib64.exe', '-lc', c], cwd=OUT_DIR, stdout=f)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmptil = Path(shutil.copy(c, tmpdir))
+            with open(h, 'wb') as f:
+                subprocess.run([IDA_PATH / 'tilib64.exe', '-lc', tmptil], cwd=OUT_DIR, stdout=f)
         py = c.with_suffix('.py')
-        subprocess.run(['python3', ROOT_DIR / 'tils2py' / 'gen_interop_til.py', h, py], cwd=OUT_DIR)
+        call_process(['python3', ROOT_DIR / 'tils2py' / 'gen_interop_til.py', h, py], cwd=OUT_DIR)
 
 def main(args):
     sdk_ver = args[0]
     prepare_ida(sdk_ver)
+    OUT_DIR.mkdir(exist_ok=True)
     do_idaclang_build('win', sdk_ver)
     do_idatil_extract('x64_win_vc_64_s', 'win', sdk_ver)
     do_export_til_headers()
